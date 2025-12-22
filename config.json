@@ -1,0 +1,22 @@
+{
+  "metadata": {
+    "name": "custom",
+    "description": "Custom configuration"
+  },
+  "transform": {
+    "shuffle_opcodes": true,
+    "encrypt_strings": true,
+    "add_junk_code": true,
+    "junk_code_ratio": 0.3
+  },
+  "encryption": {
+    "algorithm": "RC4",
+    "use_layered_encryption": true,
+    "num_layers": 2
+  },
+  "antitamper": {
+    "enable_debugger_detect": true,
+    "enable_timing_check": true,
+    "detection_action": "SILENT_FAIL"
+  }
+}
