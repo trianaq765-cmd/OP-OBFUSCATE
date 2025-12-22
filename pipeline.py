@@ -1,27 +1,30 @@
 # ============================================
-# File: pipeline.py (FIXED - Support Source Code)
-# Obfuscation Pipeline for Lua Source Code
+# File: pipeline.py (FULL VERSION untuk Replit)
+# Dengan Compile Step + Proper Obfuscation
 # ============================================
 
 import os
 import time
-import re
+import subprocess
+import tempfile
 import random
 import string
+import struct
 import base64
 import zlib
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Tuple
 from dataclasses import dataclass
+import hashlib
 
-# Import config
 from config_manager import ObfuscatorConfig
 
-# Optional imports - akan dicek ketersediaannya
+# Import komponen obfuscator
 try:
-    from lua_parser import parse_bytecode_file, LuaChunk, ControlFlowAnalyzer
-    HAS_BYTECODE_PARSER = True
-except ImportError:
-    HAS_BYTECODE_PARSER = False
+    from lua_parser import parse_bytecode, parse_bytecode_file, ControlFlowAnalyzer, LuaChunk
+    HAS_PARSER = True
+except ImportError as e:
+    print(f"Warning: lua_parser not available: {e}")
+    HAS_PARSER = False
 
 try:
     from lua_transformer import BytecodeTransformer
@@ -47,19 +50,12 @@ try:
 except ImportError:
     HAS_ANTITAMPER = False
 
-try:
-    from luraph_style import apply_luraph_style
-    HAS_LURAPH_STYLE = True
-except ImportError:
-    HAS_LURAPH_STYLE = False
-
 # ============================================
 # Pipeline Result
 # ============================================
 
 @dataclass
 class PipelineResult:
-    """Result dari pipeline execution"""
     success: bool = False
     output_path: Optional[str] = None
     total_time: float = 0.0
@@ -79,417 +75,1015 @@ class PipelineResult:
             self.warnings = []
 
 # ============================================
-# Source Code Obfuscator (Luraph-style)
+# Lua Compiler
 # ============================================
 
-class LuaSourceObfuscator:
-    """Obfuscator untuk Lua source code (bukan bytecode)"""
+class LuaCompiler:
+    """Compile Lua source to bytecode"""
     
-    def __init__(self, config: ObfuscatorConfig):
+    LUAC_PATHS = [
+        'luac', 'luac5.1', 'luac5.3', 'luac5.4',
+        '/usr/bin/luac', '/usr/local/bin/luac',
+        '/nix/store/*/bin/luac',  # Replit nix
+        './luac', './bin/luac',
+    ]
+    
+    def __init__(self):
+        self.luac_path = self._find_luac()
+        self.version = self._get_version() if self.luac_path else None
+    
+    def _find_luac(self) -> Optional[str]:
+        """Find luac executable"""
+        import glob
+        
+        for pattern in self.LUAC_PATHS:
+            if '*' in pattern:
+                matches = glob.glob(pattern)
+                for path in matches:
+                    if self._test_luac(path):
+                        return path
+            else:
+                if self._test_luac(pattern):
+                    return pattern
+        return None
+    
+    def _test_luac(self, path: str) -> bool:
+        """Test if luac works"""
+        try:
+            result = subprocess.run(
+                [path, '-v'],
+                capture_output=True,
+                timeout=5
+            )
+            return b'Lua' in result.stdout or b'Lua' in result.stderr
+        except:
+            return False
+    
+    def _get_version(self) -> str:
+        try:
+            result = subprocess.run(
+                [self.luac_path, '-v'],
+                capture_output=True,
+                timeout=5
+            )
+            output = (result.stdout + result.stderr).decode('utf-8', errors='ignore')
+            return output.strip()
+        except:
+            return "unknown"
+    
+    def is_available(self) -> bool:
+        return self.luac_path is not None
+    
+    def compile(self, source_path: str) -> bytes:
+        """Compile Lua source to bytecode"""
+        if not self.is_available():
+            raise RuntimeError("luac not found")
+        
+        fd, output_path = tempfile.mkstemp(suffix='.luac')
+        os.close(fd)
+        
+        try:
+            result = subprocess.run(
+                [self.luac_path, '-o', output_path, source_path],
+                capture_output=True,
+                timeout=60
+            )
+            
+            if result.returncode != 0:
+                error = result.stderr.decode('utf-8', errors='replace')
+                raise RuntimeError(f"Compilation failed: {error}")
+            
+            with open(output_path, 'rb') as f:
+                return f.read()
+        finally:
+            if os.path.exists(output_path):
+                os.unlink(output_path)
+    
+    def compile_source(self, source: str) -> bytes:
+        """Compile source string"""
+        fd, source_path = tempfile.mkstemp(suffix='.lua')
+        try:
+            with os.fdopen(fd, 'w', encoding='utf-8') as f:
+                f.write(source)
+            return self.compile(source_path)
+        finally:
+            if os.path.exists(source_path):
+                os.unlink(source_path)
+
+# ============================================
+# Advanced VM Generator (Luraph-style)
+# ============================================
+
+class AdvancedVMGenerator:
+    """Generate obfuscated VM interpreter"""
+    
+    def __init__(self, config, seed: int = None):
         self.config = config
-        self.string_map: Dict[str, str] = {}
-        self.var_map: Dict[str, str] = {}
-        self.func_map: Dict[str, str] = {}
-        self.seed = random.randint(1, 999999)
+        self.seed = seed or random.randint(1, 999999999)
+        random.seed(self.seed)
         
-        # Lua keywords - jangan di-rename
-        self.keywords = {
-            'and', 'break', 'do', 'else', 'elseif', 'end', 'false', 'for',
-            'function', 'goto', 'if', 'in', 'local', 'nil', 'not', 'or',
-            'repeat', 'return', 'then', 'true', 'until', 'while'
-        }
+        # Opcode mapping (shuffled)
+        self.opcode_map = self._generate_opcode_map()
         
-        # Built-in globals - jangan di-rename
-        self.builtins = {
-            'print', 'pairs', 'ipairs', 'next', 'type', 'tostring', 'tonumber',
-            'string', 'table', 'math', 'io', 'os', 'debug', 'coroutine',
-            'setmetatable', 'getmetatable', 'rawget', 'rawset', 'rawequal',
-            'select', 'unpack', 'pack', 'pcall', 'xpcall', 'error', 'assert',
-            'loadstring', 'load', 'loadfile', 'dofile', 'require', 'module',
-            '_G', '_ENV', '_VERSION', 'arg', 'self',
-            # Roblox globals
-            'game', 'workspace', 'script', 'Instance', 'Vector3', 'CFrame',
-            'Color3', 'BrickColor', 'Enum', 'UDim2', 'UDim', 'Ray', 'Region3',
-            'TweenInfo', 'NumberSequence', 'ColorSequence', 'Random', 'task',
-            'wait', 'delay', 'spawn', 'tick', 'time', 'typeof', 'warn'
-        }
+        # Variable name generator
+        self.var_counter = 0
     
-    def obfuscate(self, source: str) -> str:
-        """Main obfuscation method"""
-        
-        # Step 1: Extract and encrypt strings
-        source, strings = self._extract_strings(source)
-        
-        # Step 2: Rename variables
-        source = self._rename_variables(source)
-        
-        # Step 3: Encrypt numbers
-        source = self._encrypt_numbers(source)
-        
-        # Step 4: Add junk code
-        source = self._add_junk_code(source)
-        
-        # Step 5: Create VM wrapper
-        final_code = self._create_vm_wrapper(source, strings)
-        
-        # Step 6: Minify
-        if getattr(self.config, 'minify', True):
-            final_code = self._minify(final_code)
-        
-        return final_code
+    def _generate_opcode_map(self) -> Dict[int, int]:
+        """Generate shuffled opcode mapping"""
+        opcodes = list(range(48))  # Lua 5.1 has 38 opcodes, extra for padding
+        shuffled = opcodes.copy()
+        random.shuffle(shuffled)
+        return {orig: shuf for orig, shuf in zip(opcodes, shuffled)}
     
-    def _generate_var_name(self, length: int = 8) -> str:
+    def _gen_var(self, prefix: str = "v") -> str:
         """Generate random variable name"""
+        self.var_counter += 1
         chars = string.ascii_letters + '_'
-        first = random.choice(string.ascii_letters + '_')
-        rest = ''.join(random.choices(chars + string.digits, k=length-1))
-        return first + rest
+        name = random.choice(string.ascii_letters)
+        name += ''.join(random.choices(chars + string.digits, k=random.randint(5, 12)))
+        return name
     
-    def _extract_strings(self, source: str) -> tuple:
-        """Extract and replace strings with placeholders"""
-        strings = []
+    def generate_vm(self, chunk: 'LuaChunk') -> str:
+        """Generate complete VM code"""
         
-        def replace_string(match):
-            s = match.group(0)
-            # Skip if it's part of a comment
-            idx = len(strings)
-            strings.append(s[1:-1])  # Remove quotes
-            return f'__STR_{idx}__'
+        parts = []
         
-        # Match single and double quoted strings (basic)
-        # Note: This is simplified, doesn't handle all edge cases
-        pattern = r'"[^"\\]*(?:\\.[^"\\]*)*"|\'[^\'\\]*(?:\\.[^\'\\]*)*\''
-        source = re.sub(pattern, replace_string, source)
+        # Header
+        parts.append(self._generate_header())
         
-        return source, strings
-    
-    def _rename_variables(self, source: str) -> str:
-        """Rename local variables"""
+        # Environment capture
+        parts.append(self._generate_environment())
         
-        # Find local variable declarations
-        local_pattern = r'\blocal\s+([a-zA-Z_][a-zA-Z0-9_]*)'
+        # Utility functions
+        parts.append(self._generate_utilities())
         
-        def rename_local(match):
-            var_name = match.group(1)
-            if var_name in self.keywords or var_name in self.builtins:
-                return match.group(0)
-            
-            if var_name not in self.var_map:
-                self.var_map[var_name] = self._generate_var_name()
-            
-            return f'local {self.var_map[var_name]}'
+        # String table
+        parts.append(self._generate_string_table(chunk))
         
-        source = re.sub(local_pattern, rename_local, source)
+        # Bytecode data
+        parts.append(self._generate_bytecode_data(chunk))
         
-        # Replace usages of renamed variables
-        for old_name, new_name in self.var_map.items():
-            # Word boundary replacement
-            source = re.sub(rf'\b{re.escape(old_name)}\b', new_name, source)
+        # VM interpreter
+        parts.append(self._generate_interpreter())
         
-        return source
-    
-    def _encrypt_numbers(self, source: str) -> str:
-        """Encrypt number literals"""
+        # Anti-tamper checks
+        parts.append(self._generate_antitamper())
         
-        def encrypt_number(match):
-            num_str = match.group(0)
-            try:
-                if '.' in num_str:
-                    num = float(num_str)
-                    # Create expression that equals the number
-                    a = random.randint(1, 100)
-                    b = num * a
-                    return f'({b}/{a})'
-                else:
-                    num = int(num_str)
-                    if num == 0:
-                        return '(0)'
-                    # Create arithmetic expression
-                    a = random.randint(1, 100)
-                    b = num + a
-                    return f'({b}-{a})'
-            except:
-                return num_str
+        # Execution wrapper
+        parts.append(self._generate_executor())
         
-        # Match numbers (but not in variable names)
-        pattern = r'(?<![a-zA-Z_])(\d+\.?\d*)(?![a-zA-Z_])'
-        source = re.sub(pattern, encrypt_number, source)
-        
-        return source
-    
-    def _add_junk_code(self, source: str) -> str:
-        """Add junk/dead code"""
-        junk_snippets = [
-            'if false then local _ = nil end',
-            'do local _ = {} end',
-            'local _ = (function() end)()',
-            '_ = nil',
-            'if nil then end',
-        ]
-        
-        lines = source.split('\n')
-        new_lines = []
-        
-        for line in lines:
-            new_lines.append(line)
-            # Randomly insert junk
-            if random.random() < 0.1:  # 10% chance
-                junk = random.choice(junk_snippets)
-                new_lines.append(junk)
-        
-        return '\n'.join(new_lines)
-    
-    def _create_vm_wrapper(self, source: str, strings: List[str]) -> str:
-        """Create VM-style wrapper (Luraph-like)"""
-        
-        # Encode the source
-        encoded = base64.b64encode(
-            zlib.compress(source.encode('utf-8'))
-        ).decode('ascii')
-        
-        # Encode strings separately
-        encoded_strings = []
-        for s in strings:
-            enc = base64.b64encode(s.encode('utf-8')).decode('ascii')
-            encoded_strings.append(enc)
-        
-        # Generate header
-        header = self._generate_header()
-        
-        # Generate string decoder
-        string_decoder = self._generate_string_decoder(encoded_strings)
-        
-        # Generate main decoder/executor
-        decoder = self._generate_decoder(encoded)
-        
-        # Combine
-        return f"{header}\n\n{string_decoder}\n\n{decoder}"
+        return '\n'.join(parts)
     
     def _generate_header(self) -> str:
-        """Generate file header"""
-        preset_name = getattr(self.config, 'name', 'custom')
+        preset = getattr(self.config, 'name', 'custom')
         
-        if preset_name == 'luraph':
-            return f"-- This file was protected using Luraph Obfuscator [https://lura.ph/]\n-- Seed: {self.seed}"
+        if preset == 'luraph':
+            return f"""-- This file was protected using Luraph Obfuscator v15.2 [https://lura.ph/]
+-- Seed: {self.seed}
+-- WARNING: Tampering with this file will cause it to fail!
+"""
         else:
-            return f"-- Protected by Lua Obfuscator\n-- Preset: {preset_name}\n-- Seed: {self.seed}"
+            return f"""-- Protected by Advanced Lua Obfuscator
+-- Preset: {preset}
+-- Seed: {self.seed}
+-- DO NOT MODIFY THIS FILE
+"""
     
-    def _generate_string_decoder(self, encoded_strings: List[str]) -> str:
-        """Generate string decoding table"""
-        if not encoded_strings:
-            return "local __S = {}"
+    def _generate_environment(self) -> str:
+        """Capture environment references"""
+        env_var = self._gen_var()
         
-        # Create encoded string table
-        str_entries = ','.join(f'"{s}"' for s in encoded_strings)
+        return f"""
+local {env_var} = _G or _ENV or getfenv and getfenv() or {{}}
+local {self._gen_var()} = setmetatable
+local {self._gen_var()} = getmetatable
+local {self._gen_var()} = type
+local {self._gen_var()} = select
+local {self._gen_var()} = unpack or table.unpack
+local {self._gen_var()} = tonumber
+local {self._gen_var()} = tostring
+local {self._gen_var()} = pairs
+local {self._gen_var()} = ipairs
+local {self._gen_var()} = next
+local {self._gen_var()} = rawget
+local {self._gen_var()} = rawset
+local {self._gen_var()} = pcall
+local {self._gen_var()} = error
+local {self._gen_var()} = coroutine.create
+local {self._gen_var()} = coroutine.wrap
+local {self._gen_var()} = coroutine.yield
+local {self._gen_var()} = coroutine.resume
+local {self._gen_var()} = string.byte
+local {self._gen_var()} = string.char
+local {self._gen_var()} = string.sub
+local {self._gen_var()} = string.gsub
+local {self._gen_var()} = string.rep
+local {self._gen_var()} = string.format
+local {self._gen_var()} = math.floor
+local {self._gen_var()} = math.abs
+local {self._gen_var()} = math.fmod
+local {self._gen_var()} = table.insert
+local {self._gen_var()} = table.remove
+local {self._gen_var()} = table.concat
+local {self._gen_var()} = bit32 or bit or {{}}
+"""
+    
+    def _generate_utilities(self) -> str:
+        """Generate utility functions"""
         
-        return f"""local __S = (function()
-    local t = {{{str_entries}}}
-    local d = {{}}
-    for i, v in ipairs(t) do
-        local s = ""
-        local b = {{}}
-        for c in v:gmatch(".") do
-            b[#b+1] = c
-        end
-        -- Base64 decode
-        local chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
-        local function decode(data)
-            data = data:gsub('[^'..chars..'=]', '')
-            return (data:gsub('.', function(x)
-                if x == '=' then return '' end
-                local r, f = '', (chars:find(x) - 1)
-                for i = 6, 1, -1 do r = r .. (f % 2 ^ i - f % 2 ^ (i-1) > 0 and '1' or '0') end
-                return r
-            end):gsub('%d%d%d?%d?%d?%d?%d?%d?', function(x)
-                if #x ~= 8 then return '' end
-                local c = 0
-                for i = 1, 8 do c = c + (x:sub(i, i) == '1' and 2 ^ (8 - i) or 0) end
-                return string.char(c)
-            end))
-        end
-        d[i] = decode(v)
+        # Generate obfuscated utility function names
+        decode_fn = self._gen_var()
+        xor_fn = self._gen_var()
+        unpack_fn = self._gen_var()
+        
+        return f"""
+local function {xor_fn}(a, b)
+    local r = 0
+    local p = 1
+    while a > 0 or b > 0 do
+        local x = a % 2
+        local y = b % 2
+        if x ~= y then r = r + p end
+        a = math.floor(a / 2)
+        b = math.floor(b / 2)
+        p = p * 2
     end
-    return d
-end)()"""
-    
-    def _generate_decoder(self, encoded: str) -> str:
-        """Generate main decoder and executor"""
-        
-        # Split encoded string for obfuscation
-        chunk_size = 76
-        chunks = [encoded[i:i+chunk_size] for i in range(0, len(encoded), chunk_size)]
-        chunks_str = '+\n'.join(f'"{c}"' for c in chunks)
-        
-        return f"""local __CODE = {chunks_str}
-
-local function __DECODE(data)
-    local chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
-    data = data:gsub('[^'..chars..'=]', '')
-    return (data:gsub('.', function(x)
-        if x == '=' then return '' end
-        local r, f = '', (chars:find(x) - 1)
-        for i = 6, 1, -1 do r = r .. (f % 2 ^ i - f % 2 ^ (i-1) > 0 and '1' or '0') end
-        return r
-    end):gsub('%d%d%d?%d?%d?%d?%d?%d?', function(x)
-        if #x ~= 8 then return '' end
-        local c = 0
-        for i = 1, 8 do c = c + (x:sub(i, i) == '1' and 2 ^ (8 - i) or 0) end
-        return string.char(c)
-    end))
+    return r
 end
 
-local function __DECOMPRESS(data)
-    local ok, result = pcall(function()
-        -- Simple zlib decompress using available methods
+local function {decode_fn}(s, k)
+    local r = {{}}
+    local kl = #k
+    for i = 1, #s do
+        local c = string.byte(s, i)
+        local ki = ((i - 1) % kl) + 1
+        local kc = string.byte(k, ki)
+        r[i] = string.char({xor_fn}(c, kc))
+    end
+    return table.concat(r)
+end
+
+local function {unpack_fn}(data, pos)
+    local b1, b2, b3, b4 = string.byte(data, pos, pos + 3)
+    return b1 + b2 * 256 + b3 * 65536 + b4 * 16777216, pos + 4
+end
+"""
+    
+    def _generate_string_table(self, chunk: 'LuaChunk') -> str:
+        """Generate encrypted string table"""
+        
+        # Collect all strings
+        strings = []
+        for func in chunk.all_functions:
+            for const in func.constants:
+                if const.type == 4 and isinstance(const.value, str):
+                    if const.value not in strings:
+                        strings.append(const.value)
+        
+        if not strings:
+            return f"local {self._gen_var()} = {{}}"
+        
+        # Generate encryption key
+        key = ''.join(random.choices(string.ascii_letters + string.digits, k=32))
+        
+        # Encrypt strings
+        encrypted = []
+        for s in strings:
+            enc_bytes = []
+            for i, c in enumerate(s):
+                ki = i % len(key)
+                enc_bytes.append(chr(ord(c) ^ ord(key[ki])))
+            enc = ''.join(enc_bytes)
+            # Escape for Lua string
+            escaped = ''
+            for c in enc:
+                o = ord(c)
+                if o < 32 or o > 126 or c in '"\\':
+                    escaped += f'\\{o}'
+                else:
+                    escaped += c
+            encrypted.append(f'"{escaped}"')
+        
+        table_var = self._gen_var()
+        key_var = self._gen_var()
+        decode_var = self._gen_var()
+        
+        return f"""
+local {key_var} = "{key}"
+local {table_var} = {{{','.join(encrypted)}}}
+local {decode_var} = {{}}
+for i, v in ipairs({table_var}) do
+    local r = {{}}
+    for j = 1, #v do
+        local c = string.byte(v, j)
+        local k = string.byte({key_var}, ((j - 1) % #{key_var}) + 1)
+        r[j] = string.char(c ~ k or (c + k) % 256)
+    end
+    {decode_var}[i] = table.concat(r)
+end
+"""
+    
+    def _generate_bytecode_data(self, chunk: 'LuaChunk') -> str:
+        """Generate encoded bytecode data"""
+        
+        # Serialize function data
+        def serialize_func(func) -> List[int]:
+            data = []
+            
+            # Header
+            data.append(func.num_params)
+            data.append(func.is_vararg)
+            data.append(func.max_stack_size)
+            
+            # Instructions count
+            data.extend(self._int_to_bytes(len(func.instructions)))
+            
+            # Instructions (with opcode shuffling)
+            for instr in func.instructions:
+                # Shuffle opcode
+                orig_op = instr.raw & 0x3F
+                new_op = self.opcode_map.get(orig_op, orig_op)
+                new_raw = (instr.raw & ~0x3F) | new_op
+                data.extend(self._int_to_bytes(new_raw))
+            
+            # Constants count
+            data.extend(self._int_to_bytes(len(func.constants)))
+            
+            # Constants
+            for const in func.constants:
+                data.append(const.type)
+                if const.type == 0:  # nil
+                    pass
+                elif const.type == 1:  # bool
+                    data.append(1 if const.value else 0)
+                elif const.type == 3:  # number
+                    data.extend(self._double_to_bytes(const.value))
+                elif const.type == 4:  # string
+                    s = const.value.encode('utf-8') if isinstance(const.value, str) else b''
+                    data.extend(self._int_to_bytes(len(s)))
+                    data.extend(s)
+            
+            # Prototypes count
+            data.extend(self._int_to_bytes(len(func.prototypes)))
+            
+            return data
+        
+        main_data = serialize_func(chunk.main_function)
+        
+        # Compress data
+        compressed = zlib.compress(bytes(main_data), level=9)
+        
+        # Encode to base64-like format
+        encoded = base64.b64encode(compressed).decode('ascii')
+        
+        # Split into chunks for readability
+        chunk_size = 76
+        chunks = [encoded[i:i+chunk_size] for i in range(0, len(encoded), chunk_size)]
+        
+        data_var = self._gen_var()
+        
+        return f"""
+local {data_var} = table.concat({{
+{chr(10).join(f'    "{c}",' for c in chunks)}
+}})
+"""
+    
+    def _int_to_bytes(self, n: int) -> List[int]:
+        """Convert int to 4 bytes (little endian)"""
+        return [
+            n & 0xFF,
+            (n >> 8) & 0xFF,
+            (n >> 16) & 0xFF,
+            (n >> 24) & 0xFF
+        ]
+    
+    def _double_to_bytes(self, n: float) -> List[int]:
+        """Convert double to 8 bytes"""
+        packed = struct.pack('<d', n)
+        return list(packed)
+    
+    def _generate_interpreter(self) -> str:
+        """Generate VM interpreter"""
+        
+        vm_var = self._gen_var()
+        
+        # Generate opcode handlers
+        handlers = self._generate_opcode_handlers()
+        
+        return f"""
+local function {vm_var}(bytecode, env)
+    -- Decode bytecode
+    local data = (function()
+        local b64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
+        local dec = {{}}
+        for i = 1, 64 do dec[b64:sub(i,i)] = i - 1 end
+        
+        local str = bytecode:gsub('[^'..b64..'=]', '')
+        local result = {{}}
+        local i = 1
+        while i <= #str do
+            local a = dec[str:sub(i,i)] or 0
+            local b = dec[str:sub(i+1,i+1)] or 0
+            local c = dec[str:sub(i+2,i+2)] or 0
+            local d = dec[str:sub(i+3,i+3)] or 0
+            
+            local n = a * 262144 + b * 4096 + c * 64 + d
+            
+            result[#result + 1] = string.char(math.floor(n / 65536) % 256)
+            if str:sub(i+2,i+2) ~= '=' then
+                result[#result + 1] = string.char(math.floor(n / 256) % 256)
+            end
+            if str:sub(i+3,i+3) ~= '=' then
+                result[#result + 1] = string.char(n % 256)
+            end
+            i = i + 4
+        end
+        return table.concat(result)
+    end)()
+    
+    -- Decompress
+    local ok, decompressed = pcall(function()
+        -- Try built-in decompress methods
         if _G.syn and syn.decompress then
             return syn.decompress(data)
-        elseif _G.decompress then
-            return decompress(data)
         elseif _G.lz4 and lz4.decompress then
             return lz4.decompress(data)
+        elseif _G.zlib and zlib.decompress then
+            return zlib.decompress(data)
         else
-            -- Fallback: assume environment has zlib
-            local z = require and pcall(require, 'zlib') and require('zlib')
-            if z then return z.decompress(data) end
-            -- Last resort: return as-is (won't work if compressed)
+            -- Fallback: assume not compressed or use custom
             return data
         end
     end)
-    return ok and result or data
-end
-
-local function __EXECUTE()
-    local decoded = __DECODE(__CODE)
-    local decompressed = __DECOMPRESS(decoded)
     
-    -- Replace string placeholders
-    local code = decompressed:gsub("__STR_(%d+)__", function(idx)
-        local i = tonumber(idx) + 1
-        return '"' .. (__S[i] or "") .. '"'
-    end)
+    if not ok then
+        error("Decompression failed")
+    end
     
-    -- Execute
-    local fn, err = loadstring or load
-    if fn then
-        local chunk, lerr = fn(code)
-        if chunk then
-            return chunk()
-        else
-            error("Failed to load: " .. tostring(lerr))
+    data = decompressed
+    
+    -- Parse bytecode
+    local pos = 1
+    local function readByte()
+        local b = string.byte(data, pos)
+        pos = pos + 1
+        return b
+    end
+    
+    local function readInt()
+        local b1, b2, b3, b4 = string.byte(data, pos, pos + 3)
+        pos = pos + 4
+        return b1 + b2 * 256 + b3 * 65536 + b4 * 16777216
+    end
+    
+    local function readDouble()
+        local bytes = {{string.byte(data, pos, pos + 7)}}
+        pos = pos + 8
+        -- IEEE 754 decode
+        local sign = bytes[8] >= 128 and -1 or 1
+        local exp = (bytes[8] % 128) * 16 + math.floor(bytes[7] / 16)
+        local mantissa = 0
+        for i = 1, 6 do
+            mantissa = mantissa + bytes[i] * (2 ^ ((i - 1) * 8))
         end
-    else
-        error("No loadstring available")
+        mantissa = mantissa + (bytes[7] % 16) * (2 ^ 48)
+        
+        if exp == 0 then
+            return sign * mantissa * (2 ^ -1074)
+        elseif exp == 2047 then
+            return mantissa == 0 and (sign * math.huge) or (0/0)
+        else
+            return sign * (1 + mantissa / (2 ^ 52)) * (2 ^ (exp - 1023))
+        end
+    end
+    
+    local function readString()
+        local len = readInt()
+        if len == 0 then return "" end
+        local s = data:sub(pos, pos + len - 1)
+        pos = pos + len
+        return s
+    end
+    
+    -- Opcode reverse mapping
+    local opcodeMap = {{}}
+    {self._generate_opcode_reverse_map()}
+    
+    -- Parse function
+    local function parseFunction()
+        local func = {{}}
+        
+        func.numParams = readByte()
+        func.isVararg = readByte()
+        func.maxStack = readByte()
+        
+        -- Instructions
+        local numInstr = readInt()
+        func.instructions = {{}}
+        for i = 1, numInstr do
+            local raw = readInt()
+            -- Unshuffle opcode
+            local op = raw % 64
+            local realOp = opcodeMap[op] or op
+            func.instructions[i] = (raw - op) + realOp
+        end
+        
+        -- Constants
+        local numConst = readInt()
+        func.constants = {{}}
+        for i = 1, numConst do
+            local t = readByte()
+            if t == 0 then
+                func.constants[i] = nil
+            elseif t == 1 then
+                func.constants[i] = readByte() ~= 0
+            elseif t == 3 then
+                func.constants[i] = readDouble()
+            elseif t == 4 then
+                func.constants[i] = readString()
+            end
+        end
+        
+        -- Prototypes
+        local numProtos = readInt()
+        func.prototypes = {{}}
+        for i = 1, numProtos do
+            func.prototypes[i] = parseFunction()
+        end
+        
+        return func
+    end
+    
+    local mainFunc = parseFunction()
+    
+    -- VM Execution
+    local function execute(func, upvals)
+        local stack = {{}}
+        local top = 0
+        local pc = 1
+        local constants = func.constants
+        local instructions = func.instructions
+        local protos = func.prototypes
+        local openUpvals = {{}}
+        
+        local function getUpval(idx)
+            return upvals[idx + 1]
+        end
+        
+        local function setUpval(idx, val)
+            upvals[idx + 1] = val
+        end
+        
+        while true do
+            local instr = instructions[pc]
+            if not instr then break end
+            
+            local op = instr % 64
+            local A = math.floor(instr / 64) % 256
+            local B = math.floor(instr / 8388608) % 512
+            local C = math.floor(instr / 16384) % 512
+            local Bx = math.floor(instr / 16384)
+            local sBx = Bx - 131071
+            
+            pc = pc + 1
+            
+{handlers}
+        end
+        
+        return stack[1]
+    end
+    
+    return function(...)
+        local args = {{...}}
+        return execute(mainFunc, {{}})
     end
 end
-
-return __EXECUTE()"""
+"""
     
-    def _minify(self, code: str) -> str:
-        """Minify the code"""
+    def _generate_opcode_reverse_map(self) -> str:
+        """Generate reverse opcode mapping"""
         lines = []
-        in_multiline_string = False
+        for orig, shuf in self.opcode_map.items():
+            lines.append(f"    opcodeMap[{shuf}] = {orig}")
+        return '\n'.join(lines)
+    
+    def _generate_opcode_handlers(self) -> str:
+        """Generate opcode handlers"""
         
-        for line in code.split('\n'):
-            stripped = line.strip()
+        # Simplified handlers for common opcodes
+        return """
+            -- MOVE
+            if op == 0 then
+                stack[A + 1] = stack[B + 1]
             
-            # Skip empty lines
-            if not stripped:
-                continue
+            -- LOADK
+            elseif op == 1 then
+                stack[A + 1] = constants[Bx + 1]
             
-            # Keep comments that are part of header
-            if stripped.startswith('--') and ('Protected' in stripped or 'Luraph' in stripped or 'Seed' in stripped):
-                lines.append(stripped)
-                continue
+            -- LOADBOOL
+            elseif op == 2 then
+                stack[A + 1] = B ~= 0
+                if C ~= 0 then pc = pc + 1 end
             
-            # Remove single-line comments (but not in strings)
-            if '--' in stripped and not in_multiline_string:
-                # Simple check - remove comment part
-                comment_idx = stripped.find('--')
-                # Make sure it's not inside a string
-                quote_count = stripped[:comment_idx].count('"') + stripped[:comment_idx].count("'")
-                if quote_count % 2 == 0:
-                    stripped = stripped[:comment_idx].strip()
-                    if not stripped:
-                        continue
+            -- LOADNIL
+            elseif op == 3 then
+                for i = A, B do
+                    stack[i + 1] = nil
+                end
             
-            lines.append(stripped)
+            -- GETUPVAL
+            elseif op == 4 then
+                stack[A + 1] = getUpval(B)
+            
+            -- GETGLOBAL
+            elseif op == 5 then
+                stack[A + 1] = env[constants[Bx + 1]]
+            
+            -- GETTABLE
+            elseif op == 6 then
+                local key = C >= 256 and constants[C - 255] or stack[C + 1]
+                stack[A + 1] = stack[B + 1][key]
+            
+            -- SETGLOBAL
+            elseif op == 7 then
+                env[constants[Bx + 1]] = stack[A + 1]
+            
+            -- SETUPVAL
+            elseif op == 8 then
+                setUpval(B, stack[A + 1])
+            
+            -- SETTABLE
+            elseif op == 9 then
+                local key = B >= 256 and constants[B - 255] or stack[B + 1]
+                local val = C >= 256 and constants[C - 255] or stack[C + 1]
+                stack[A + 1][key] = val
+            
+            -- NEWTABLE
+            elseif op == 10 then
+                stack[A + 1] = {}
+            
+            -- SELF
+            elseif op == 11 then
+                local key = C >= 256 and constants[C - 255] or stack[C + 1]
+                stack[A + 2] = stack[B + 1]
+                stack[A + 1] = stack[B + 1][key]
+            
+            -- ADD
+            elseif op == 12 then
+                local b = B >= 256 and constants[B - 255] or stack[B + 1]
+                local c = C >= 256 and constants[C - 255] or stack[C + 1]
+                stack[A + 1] = b + c
+            
+            -- SUB
+            elseif op == 13 then
+                local b = B >= 256 and constants[B - 255] or stack[B + 1]
+                local c = C >= 256 and constants[C - 255] or stack[C + 1]
+                stack[A + 1] = b - c
+            
+            -- MUL
+            elseif op == 14 then
+                local b = B >= 256 and constants[B - 255] or stack[B + 1]
+                local c = C >= 256 and constants[C - 255] or stack[C + 1]
+                stack[A + 1] = b * c
+            
+            -- DIV
+            elseif op == 15 then
+                local b = B >= 256 and constants[B - 255] or stack[B + 1]
+                local c = C >= 256 and constants[C - 255] or stack[C + 1]
+                stack[A + 1] = b / c
+            
+            -- MOD
+            elseif op == 16 then
+                local b = B >= 256 and constants[B - 255] or stack[B + 1]
+                local c = C >= 256 and constants[C - 255] or stack[C + 1]
+                stack[A + 1] = b % c
+            
+            -- POW
+            elseif op == 17 then
+                local b = B >= 256 and constants[B - 255] or stack[B + 1]
+                local c = C >= 256 and constants[C - 255] or stack[C + 1]
+                stack[A + 1] = b ^ c
+            
+            -- UNM
+            elseif op == 18 then
+                stack[A + 1] = -stack[B + 1]
+            
+            -- NOT
+            elseif op == 19 then
+                stack[A + 1] = not stack[B + 1]
+            
+            -- LEN
+            elseif op == 20 then
+                stack[A + 1] = #stack[B + 1]
+            
+            -- CONCAT
+            elseif op == 21 then
+                local t = {}
+                for i = B, C do
+                    t[#t + 1] = stack[i + 1]
+                end
+                stack[A + 1] = table.concat(t)
+            
+            -- JMP
+            elseif op == 22 then
+                pc = pc + sBx
+            
+            -- EQ
+            elseif op == 23 then
+                local b = B >= 256 and constants[B - 255] or stack[B + 1]
+                local c = C >= 256 and constants[C - 255] or stack[C + 1]
+                if (b == c) ~= (A ~= 0) then
+                    pc = pc + 1
+                end
+            
+            -- LT
+            elseif op == 24 then
+                local b = B >= 256 and constants[B - 255] or stack[B + 1]
+                local c = C >= 256 and constants[C - 255] or stack[C + 1]
+                if (b < c) ~= (A ~= 0) then
+                    pc = pc + 1
+                end
+            
+            -- LE
+            elseif op == 25 then
+                local b = B >= 256 and constants[B - 255] or stack[B + 1]
+                local c = C >= 256 and constants[C - 255] or stack[C + 1]
+                if (b <= c) ~= (A ~= 0) then
+                    pc = pc + 1
+                end
+            
+            -- TEST
+            elseif op == 26 then
+                if (not not stack[A + 1]) ~= (C ~= 0) then
+                    pc = pc + 1
+                end
+            
+            -- TESTSET
+            elseif op == 27 then
+                if (not not stack[B + 1]) ~= (C ~= 0) then
+                    pc = pc + 1
+                else
+                    stack[A + 1] = stack[B + 1]
+                end
+            
+            -- CALL
+            elseif op == 28 then
+                local func = stack[A + 1]
+                local args = {}
+                local nArgs = B - 1
+                if nArgs < 0 then nArgs = top - A - 1 end
+                for i = 1, nArgs do
+                    args[i] = stack[A + 1 + i]
+                end
+                local rets = {func(unpack(args))}
+                local nRets = C - 1
+                if nRets < 0 then
+                    for i = 1, #rets do
+                        stack[A + i] = rets[i]
+                    end
+                    top = A + #rets
+                else
+                    for i = 1, nRets do
+                        stack[A + i] = rets[i]
+                    end
+                end
+            
+            -- TAILCALL
+            elseif op == 29 then
+                local func = stack[A + 1]
+                local args = {}
+                local nArgs = B - 1
+                if nArgs < 0 then nArgs = top - A - 1 end
+                for i = 1, nArgs do
+                    args[i] = stack[A + 1 + i]
+                end
+                return func(unpack(args))
+            
+            -- RETURN
+            elseif op == 30 then
+                local rets = {}
+                local nRets = B - 1
+                if nRets < 0 then nRets = top - A end
+                for i = 1, nRets do
+                    rets[i] = stack[A + i]
+                end
+                return unpack(rets)
+            
+            -- FORLOOP
+            elseif op == 31 then
+                local step = stack[A + 3]
+                local idx = stack[A + 1] + step
+                local limit = stack[A + 2]
+                if (step > 0 and idx <= limit) or (step <= 0 and idx >= limit) then
+                    pc = pc + sBx
+                    stack[A + 1] = idx
+                    stack[A + 4] = idx
+                end
+            
+            -- FORPREP
+            elseif op == 32 then
+                stack[A + 1] = stack[A + 1] - stack[A + 3]
+                pc = pc + sBx
+            
+            -- TFORLOOP
+            elseif op == 33 then
+                local rets = {stack[A + 1](stack[A + 2], stack[A + 3])}
+                for i = 1, C do
+                    stack[A + 3 + i] = rets[i]
+                end
+                if stack[A + 4] ~= nil then
+                    stack[A + 3] = stack[A + 4]
+                else
+                    pc = pc + 1
+                end
+            
+            -- SETLIST
+            elseif op == 34 then
+                local tbl = stack[A + 1]
+                local nElems = B == 0 and (top - A) or B
+                local offset = (C - 1) * 50
+                for i = 1, nElems do
+                    tbl[offset + i] = stack[A + 1 + i]
+                end
+            
+            -- CLOSE
+            elseif op == 35 then
+                -- Close upvalues (simplified)
+            
+            -- CLOSURE
+            elseif op == 36 then
+                local proto = protos[Bx + 1]
+                local newUpvals = {}
+                stack[A + 1] = function(...)
+                    return execute(proto, newUpvals)(...)
+                end
+            
+            -- VARARG
+            elseif op == 37 then
+                -- Handle varargs (simplified)
+            
+            end
+"""
+    
+    def _generate_antitamper(self) -> str:
+        """Generate anti-tamper checks"""
+        return f"""
+-- Anti-tamper
+local function {self._gen_var()}()
+    local ok, err = pcall(function()
+        -- Environment check
+        if not _G or not _ENV and not getfenv then
+            return false
+        end
+        -- Debug check
+        if debug and debug.getinfo then
+            local info = debug.getinfo(1)
+            if info and info.what == "C" then
+                return false
+            end
+        end
+        return true
+    end)
+    return ok and err
+end
+"""
+    
+    def _generate_executor(self) -> str:
+        """Generate execution wrapper"""
         
-        # Join with minimal whitespace
-        result = ' '.join(lines)
+        vm_call = self._gen_var()
+        data_ref = self._gen_var()
         
-        # Clean up multiple spaces
-        while '  ' in result:
-            result = result.replace('  ', ' ')
-        
-        # Clean up spaces around operators
-        for op in ['=', '+', '-', '*', '/', '%', '^', '<', '>', ',', '(', ')', '{', '}', '[', ']']:
-            result = result.replace(f' {op} ', op)
-            result = result.replace(f' {op}', op)
-            result = result.replace(f'{op} ', op)
-        
-        # Restore necessary spaces
-        result = result.replace('local', 'local ')
-        result = result.replace('function', 'function ')
-        result = result.replace('return', 'return ')
-        result = result.replace('if', 'if ')
-        result = result.replace('then', ' then ')
-        result = result.replace('else', ' else ')
-        result = result.replace('elseif', ' elseif ')
-        result = result.replace('end', ' end ')
-        result = result.replace('do', ' do ')
-        result = result.replace('for', 'for ')
-        result = result.replace('while', 'while ')
-        result = result.replace('repeat', 'repeat ')
-        result = result.replace('until', ' until ')
-        result = result.replace('in', ' in ')
-        result = result.replace('and', ' and ')
-        result = result.replace('or', ' or ')
-        result = result.replace('not', 'not ')
-        
-        # Clean up double spaces again
-        while '  ' in result:
-            result = result.replace('  ', ' ')
-        
-        return result.strip()
+        return f"""
+-- Initialize and execute
+local {vm_call} = {self._gen_var()}({self._gen_var()}, _G or _ENV)
+if {vm_call} then
+    return {vm_call}()
+else
+    error("VM initialization failed - file may be corrupted")
+end
+"""
 
 # ============================================
-# Main Pipeline
+# Main Pipeline Class
 # ============================================
 
 class ObfuscationPipeline:
-    """Obfuscation pipeline - supports both source and bytecode"""
+    """Main obfuscation pipeline"""
     
     def __init__(self, config: ObfuscatorConfig):
         self.config = config
+        self.compiler = LuaCompiler()
+        
+        # Check components
+        print(f"[*] Components:")
+        print(f"    Parser: {'✓' if HAS_PARSER else '✗'}")
+        print(f"    Transformer: {'✓' if HAS_TRANSFORMER else '✗'}")
+        print(f"    VM Generator: {'✓' if HAS_VM_GENERATOR else '✗ (using built-in)'}")
+        print(f"    Compiler: {'✓ ' + self.compiler.version if self.compiler.is_available() else '✗'}")
     
     def process(self, input_path: str, output_path: str) -> PipelineResult:
-        """Execute pipeline"""
+        """Execute obfuscation pipeline"""
         result = PipelineResult()
         start_time = time.time()
         
         try:
-            # Validate input
             if not os.path.exists(input_path):
                 raise FileNotFoundError(f"Input not found: {input_path}")
             
             result.input_size = os.path.getsize(input_path)
             
-            # Read file
             with open(input_path, 'rb') as f:
                 file_data = f.read()
             
-            # ============================================
-            # DETECT FILE TYPE
-            # ============================================
+            # Detect file type
+            is_source = self._is_source_code(file_data)
             
-            is_bytecode = self._is_bytecode(file_data)
+            print(f"\n[*] Input: {input_path}")
+            print(f"[*] Size: {result.input_size:,} bytes")
+            print(f"[*] Type: {'Source code' if is_source else 'Bytecode'}")
+            print(f"[*] Preset: {getattr(self.config, 'name', 'custom')}")
+            print()
             
-            if is_bytecode:
-                print("[*] Detected: Bytecode")
-                final_code = self._process_bytecode(input_path, file_data)
+            # Step 1: Get bytecode
+            if is_source:
+                print("[1/6] Compiling source to bytecode...")
+                if not self.compiler.is_available():
+                    raise RuntimeError(
+                        "Lua compiler (luac) not found!\n"
+                        "Install with: apt install lua5.3\n"
+                        "Or add to replit.nix: pkgs.lua5_3"
+                    )
+                bytecode = self.compiler.compile(input_path)
+                print(f"  ✓ Compiled: {len(bytecode):,} bytes")
             else:
-                print("[*] Detected: Source code")
-                final_code = self._process_source(file_data)
+                print("[1/6] Reading bytecode...")
+                bytecode = file_data
+                print(f"  ✓ Read: {len(bytecode):,} bytes")
+            
+            # Step 2: Parse bytecode
+            print("[2/6] Parsing bytecode...")
+            if not HAS_PARSER:
+                raise RuntimeError("lua_parser module not available")
+            
+            chunk = parse_bytecode(bytecode)
+            
+            if not chunk.header.is_valid:
+                errors = chunk.header.validation_errors
+                raise RuntimeError(f"Invalid bytecode: {errors}")
+            
+            print(f"  ✓ Functions: {len(chunk.all_functions)}")
+            print(f"  ✓ Instructions: {chunk.stats.get('total_instructions', 0):,}")
+            print(f"  ✓ Constants: {chunk.stats.get('total_constants', 0):,}")
+            
+            # Step 3: Analyze
+            print("[3/6] Analyzing control flow...")
+            for func in chunk.all_functions:
+                analyzer = ControlFlowAnalyzer(func)
+                analyzer.analyze()
+            print("  ✓ Analysis complete")
+            
+            # Step 4: Transform
+            print("[4/6] Transforming bytecode...")
+            if HAS_TRANSFORMER and hasattr(self.config, 'transform'):
+                self.config.transform.generate_random_values()
+                transformer = BytecodeTransformer(self.config.transform)
+                chunk, _ = transformer.transform(chunk)
+            print("  ✓ Transformed")
+            
+            # Step 5: Generate VM
+            print("[5/6] Generating obfuscated VM...")
+            
+            seed = getattr(self.config, 'seed', None) or random.randint(1, 999999999)
+            vm_gen = AdvancedVMGenerator(self.config, seed=seed)
+            
+            if HAS_VM_GENERATOR:
+                # Use external generator if available
+                generator = LuaVMGenerator(
+                    getattr(self.config, 'transform', None),
+                    getattr(self.config, 'vm', None)
+                )
+                vm_code = generator.generate_vm()
+            else:
+                # Use built-in generator
+                vm_code = vm_gen.generate_vm(chunk)
+            
+            print(f"  ✓ VM generated: {len(vm_code):,} chars")
+            
+            # Step 6: Add protection layers
+            print("[6/6] Adding protection layers...")
+            
+            final_code = vm_code
+            
+            # Add junk code if enabled
+            if hasattr(self.config, 'transform') and getattr(self.config.transform, 'add_junk_code', False):
+                final_code = self._add_junk_code(final_code)
+            
+            # Add watermark
+            if hasattr(self.config, 'watermark') and self.config.watermark:
+                final_code = self._add_watermark(final_code, self.config.watermark)
+            
+            print(f"  ✓ Final size: {len(final_code):,} chars")
             
             # Write output
             with open(output_path, 'w', encoding='utf-8') as f:
@@ -499,142 +1093,67 @@ class ObfuscationPipeline:
             result.success = True
             result.output_path = output_path
             result.output_size = len(final_code.encode('utf-8'))
-            result.size_ratio = result.output_size / result.input_size if result.input_size > 0 else 0
+            result.size_ratio = result.output_size / result.input_size
             result.stats = {
-                'input_type': 'bytecode' if is_bytecode else 'source',
-                'output_size': result.output_size,
+                'functions': len(chunk.all_functions),
+                'instructions': chunk.stats.get('total_instructions', 0),
+                'vm_size': len(vm_code),
             }
             
-            print(f"[✓] Obfuscation complete: {result.output_size} bytes")
+            print()
+            print(f"[✓] Obfuscation complete!")
+            print(f"    Output: {output_path}")
+            print(f"    Size: {result.output_size:,} bytes ({result.size_ratio:.1f}x)")
             
         except Exception as e:
             result.errors.append(str(e))
             result.success = False
-            print(f"[✗] Error: {e}")
+            print(f"\n[✗] Error: {e}")
             import traceback
             traceback.print_exc()
         
         result.total_time = time.time() - start_time
         return result
     
-    def _is_bytecode(self, data: bytes) -> bool:
-        """Check if data is bytecode"""
-        # Lua 5.x signature
+    def _is_source_code(self, data: bytes) -> bool:
+        """Detect if input is source code"""
         if data[:4] == b'\x1bLua':
-            return True
-        # LuaJIT signature
+            return False
         if data[:3] == b'\x1bLJ':
-            return True
-        # Luau (version byte 0-6)
-        if len(data) > 0 and data[0] <= 6:
-            # Additional check - try to decode as UTF-8
-            try:
-                text = data[:200].decode('utf-8')
-                # If it looks like Lua code, it's source
-                if any(kw in text for kw in ['function', 'local', 'if', 'end', 'return', '--']):
-                    return False
-            except UnicodeDecodeError:
-                return True
-        
-        # Try to decode as UTF-8
-        try:
-            data.decode('utf-8')
-            return False  # Successfully decoded = source code
-        except UnicodeDecodeError:
-            return True  # Failed to decode = probably bytecode
-    
-    def _process_source(self, file_data: bytes) -> str:
-        """Process Lua source code"""
-        print("[1/4] Reading source code...")
+            return False
         
         try:
-            source = file_data.decode('utf-8')
-        except UnicodeDecodeError:
-            source = file_data.decode('latin-1')
-        
-        print(f"  ✓ Read {len(source)} characters, {len(source.splitlines())} lines")
-        
-        print("[2/4] Initializing obfuscator...")
-        obfuscator = LuaSourceObfuscator(self.config)
-        print("  ✓ Obfuscator ready")
-        
-        print("[3/4] Obfuscating...")
-        result = obfuscator.obfuscate(source)
-        print(f"  ✓ Obfuscated: {len(result)} characters")
-        
-        print("[4/4] Finalizing...")
-        print("  ✓ Done")
-        
-        return result
+            text = data[:500].decode('utf-8')
+            keywords = ['function', 'local', 'if', 'then', 'end', 'for', 'while', 'return']
+            return any(kw in text for kw in keywords)
+        except:
+            return False
     
-    def _process_bytecode(self, input_path: str, file_data: bytes) -> str:
-        """Process Lua bytecode (original pipeline logic)"""
-        
-        if not HAS_BYTECODE_PARSER:
-            raise Exception("Bytecode parser not available. Please provide source code (.lua) instead.")
-        
-        print("[1/7] Parsing bytecode...")
-        chunk = parse_bytecode_file(input_path)
-        print(f"  ✓ Parsed {len(chunk.all_functions)} functions")
-        
-        print("[2/7] Analyzing...")
-        for func in chunk.all_functions:
-            analyzer = ControlFlowAnalyzer(func)
-            analyzer.analyze()
-        print("  ✓ Analysis complete")
-        
-        print("[3/7] Transforming...")
-        if HAS_TRANSFORMER:
-            self.config.transform.generate_random_values()
-            transformer = BytecodeTransformer(self.config.transform)
-            transformed_chunk, metadata = transformer.transform(chunk)
-        else:
-            transformed_chunk = chunk
-            metadata = {}
-        print("  ✓ Transformed")
-        
-        print("[4/7] Encrypting...")
-        if HAS_ENCRYPTION:
-            self.config.encryption.generate_keys()
-            enc_manager = EncryptionManager(self.config.encryption)
-        print("  ✓ Encrypted")
-        
-        print("[5/7] Generating VM...")
-        if HAS_VM_GENERATOR:
-            generator = LuaVMGenerator(self.config.transform, self.config.vm)
-            vm_code = generator.generate_vm()
-        else:
-            vm_code = "-- VM code placeholder"
-        print(f"  ✓ VM generated ({len(vm_code)} chars)")
-        
-        print("[6/7] Adding protection...")
-        if HAS_ANTITAMPER:
-            self.config.antitamper.generate_keys()
-            antitamper = AntiTamperGenerator(self.config.antitamper)
-            protection_code = antitamper.generate_all_protections()
-        else:
-            protection_code = ""
-        print(f"  ✓ Protection added")
-        
-        print("[7/7] Combining...")
-        
-        # Serialize bytecode
-        if HAS_VM_GENERATOR:
-            serializer = BytecodeSerializer(None)
-            bytecode_str = serializer.serialize_function(transformed_chunk.main_function)
-        else:
-            bytecode_str = "{}"
-        
-        # Combine
-        parts = [
-            f"-- Protected by Lua Obfuscator",
-            protection_code,
-            vm_code,
-            f"local bytecode = {bytecode_str}",
-            "-- Execute\nreturn bytecode"
+    def _add_junk_code(self, code: str) -> str:
+        """Add junk code to increase size and complexity"""
+        junk_templates = [
+            'if false then local {} = {} end',
+            'do local {} = function() end end',
+            '_ = nil',
+            'local {} = (function() return nil end)()',
+            'if nil then {} = {} end',
         ]
         
-        final_code = "\n\n".join(p for p in parts if p)
-        print(f"  ✓ Combined ({len(final_code)} chars)")
+        lines = code.split('\n')
+        new_lines = []
         
-        return final_code
+        for line in lines:
+            new_lines.append(line)
+            if random.random() < 0.15:  # 15% chance
+                template = random.choice(junk_templates)
+                var1 = ''.join(random.choices(string.ascii_letters, k=8))
+                var2 = ''.join(random.choices(string.ascii_letters, k=8))
+                junk = template.format(var1, var2)
+                new_lines.append(junk)
+        
+        return '\n'.join(new_lines)
+    
+    def _add_watermark(self, code: str, watermark: str) -> str:
+        """Add hidden watermark"""
+        encoded = base64.b64encode(watermark.encode()).decode()
+        return f'-- {encoded}\n{code}'
